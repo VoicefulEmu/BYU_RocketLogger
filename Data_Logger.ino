@@ -39,8 +39,10 @@ void loop() {
 
   if (ok1 && ok2 && ok3) {
     sdlog_write_csv(s);
+    webui_set_latest(s);
   }
-  webui_set_latest(s);   // update dashboard data
-  webui_loop();            // keep HTTP responsive [web:521]
+
+  webui_loop();
 }
+
 
