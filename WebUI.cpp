@@ -97,7 +97,14 @@ static void handle_root() {
         "<div class='label'>Status</div>"
         "<div class='value'><span id='status' class='status-bad'>Connecting…</span></div>"
       "</div>"
+
+      "<div class='card'>"
+        "<div class='label'>Sample rate</div>"
+        "<div class='value'><span id='rateHz'>–</span><span class='units'> Hz</span></div>"
+      "</div>"
+
     "</div>"
+    
 
     "<div class='card'>"
       "<h2>IMU Accel / Gyro / Mag</h2>"
@@ -156,6 +163,10 @@ static void handle_root() {
       "}"
     "}"
 
+    "let last_t_us = null;"
+    "let last_rate_hz = null;"
+
+
     "async function tick(){"
       "try{"
         "const r=await fetch('/latest',{cache:'no-cache'});"
@@ -184,10 +195,19 @@ static void handle_root() {
             "const mm = String(minutes).padStart(2, '0');"
             "const ss = String(seconds).padStart(2, '0');"
             "setText('t_hms', hh + ':' + mm + ':' + ss);"
-          "}"
-
-
-
+            "if (last_t_us !== null) {"
+              "const dt_us = t_us - last_t_us;"
+              "if (dt_us > 0) {"
+                "const rate_hz = 1e6 / dt_us;"
+                "last_rate_hz = rate_hz;"
+                "setText('rateHz', rate_hz.toFixed(1));"
+              "}"
+            "}"
+            "last_t_us = t_us;"
+          "} else {"
+            "setText('rateHz', '–');"
+        "}"
+        
         "if(d['a(m/s^2)']){"
           "const a=d['a(m/s^2)'].split(',');"
           "setText('ax',a[0]||'–');"
