@@ -1,0 +1,20 @@
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Arduino / build artifacts
+build/
+*.elf
+*.bin
+*.hex
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# PlatformIO (if you ever use it)
+.pio/
+
+# Local config / secrets (create these locally, don’t commit)
+secrets.h
+wifi_config.h
