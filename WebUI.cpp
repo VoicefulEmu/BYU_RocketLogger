@@ -209,19 +209,10 @@ static void handle_root() {
 
         "if(d['imuTempC']) setText('imuTempC', d['imuTempC']);"
 
-        "if(d['baroTempC']){"
-          "const btLine=d['baroTempC'];"
-          "const parts=btLine.split(' ');"
-          "setText('baroTempC', parts[0]||'–');"
-          "parts.forEach(p=>{"
-            "if(p.startsWith('pressPa')){"
-              "const v=p.split('=')[1]; setText('pressPa',v||'–');"
-            "}"
-            "if(p.startsWith('altM')){"
-              "const v=p.split('=')[1]; setText('altM',v||'–');"
-            "}"
-          "});"
-        "}"
+        "if (d['baroTempC']) setText('baroTempC', d['baroTempC']);"
+        "if (d['pressPa'])   setText('pressPa',   d['pressPa']);"
+        "if (d['altM'])      setText('altM',      d['altM']);"
+
 
         "if(d['highG(m/s^2)']){"
           "const h=d['highG(m/s^2)'].split(',');"
@@ -243,7 +234,7 @@ static void handle_root() {
       "}"
     "}"
 
-        "async function startLogging(){"
+    "async function startLogging(){"
       "try{"
         "const r = await fetch('/start',{cache:'no-cache'});"
         "const msg = await r.text();"
@@ -292,8 +283,12 @@ static void handle_latest() {
   line += "g(rad/s)=" + String(latest.gx, 3) + "," + String(latest.gy, 3) + "," + String(latest.gz, 3) + "\n";
   line += "m(uT)=" + String(latest.mx, 2) + "," + String(latest.my, 2) + "," + String(latest.mz, 2) + "\n";
   line += "imuTempC=" + String(latest.imuTempC, 2) + "\n";
-  line += "baroTempC=" + String(latest.baroTempC, 2) + " pressPa=" + String(latest.pressPa, 1) +
-          " altM=" + String(latest.altM, 2) + "\n";
+
+  // NEW: three simple baro lines
+  line += "baroTempC=" + String(latest.baroTempC, 2) + "\n";
+  line += "pressPa="   + String(latest.pressPa,   1) + "\n";
+  line += "altM="      + String(latest.altM,      2) + "\n";
+
   line += "highG(m/s^2)=" + String(latest.hgx, 3) + "," + String(latest.hgy, 3) + "," + String(latest.hgz, 3) + "\n";
 
   // Add state here
