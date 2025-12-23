@@ -37,6 +37,43 @@ def mean_gyro_from_files(paths):
     return np.mean(allg, axis=0), np.std(allg, axis=0)
 
 
+def mean_mag_from_file(path):
+    df = pd.read_csv(path)
+    # expect columns mx,my,mz
+    return np.array([df['mx'].mean(), df['my'].mean(), df['mz'].mean()], dtype=float)
+
+
+def compute_mag_cal(files):
+    """Compute simple magnetometer hard-iron and per-axis scale.
+
+    Strategy:
+    - concatenate all samples from provided files
+    - compute bias = mean across all samples
+    - subtract bias and compute per-axis std
+    - set scale = mean(std_axes) / std_axis (equalize axis gains)
+    Returns (bias_list, scale_list)
+    """
+    arrs = []
+    for p in files:
+        df = pd.read_csv(p)
+        if all(c in df.columns for c in ('mx', 'my', 'mz')):
+            arrs.append(df[['mx', 'my', 'mz']].to_numpy())
+    if len(arrs) == 0:
+        return [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]
+    allm = np.vstack(arrs)
+    bias = np.mean(allm, axis=0)
+    m_centered = allm - bias[np.newaxis, :]
+    stds = np.std(m_centered, axis=0)
+    mean_std = float(np.mean(stds)) if np.any(stds > 0) else 1.0
+    scales = np.ones(3)
+    for i in range(3):
+        if stds[i] <= 0:
+            scales[i] = 1.0
+        else:
+            scales[i] = mean_std / float(stds[i])
+    return bias.tolist(), scales.tolist()
+
+
 def extract_static_segments(file, out_dir='poses', min_seg_sec=2.0, std_window_sec=0.5, max_segments=6):
     """Detect stationary segments in a long log and save the longest `max_segments` as CSVs.
 
@@ -161,36 +198,66 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--accel-files', nargs=6, help='Six accel files in order: +X -X +Y -Y +Z -Z')
     p.add_argument('--gyro-files', nargs='*', help='Stationary gyro files to estimate bias/std', default=[])
+    p.add_argument('--mag-files', nargs='*', help='Magnetometer files to estimate bias/scale', default=[])
     p.add_argument('--out', default='calib.json')
     p.add_argument('--extract-from', help='Single long log CSV to auto-extract six pose segments')
     p.add_argument('--out-dir', help='Directory to save extracted pose CSVs', default='poses')
     p.add_argument('--min-seg-sec', type=float, default=2.0, help='Minimum stationary segment length (s)')
     args = p.parse_args()
+
     # If extract-from is provided, detect and save six longest stationary segments
+    saved = None
     if args.extract_from:
         print(f'Extracting poses from {args.extract_from} ...')
         saved = extract_static_segments(args.extract_from, out_dir=args.out_dir, min_seg_sec=args.min_seg_sec)
         print('Saved pose files:')
         for s in saved:
             print('  ', s)
-        # if we extracted exactly 6, set as accel-files for calibration
+        # if we extracted at least 6, set as accel-files for calibration
         if len(saved) >= 6:
             accel_files = saved[:6]
         else:
             raise RuntimeError('Extracted fewer than 6 pose segments; re-record with clearer stationary poses')
     else:
+        if not args.accel_files:
+            raise RuntimeError('No accel files provided and --extract-from not used')
         accel_files = args.accel_files
 
     means = [mean_accel_from_file(f) for f in accel_files]
     accel_bias, accel_scale = compute_accel_cal(means)
 
-    gyro_bias, gyro_std = mean_gyro_from_files(args.gyro_files)
+    # Compute gyro bias/std: prefer explicit --gyro-files; otherwise try using saved extracted segments
+    if args.gyro_files and len(args.gyro_files) > 0:
+        gyro_sources = args.gyro_files
+    elif saved is not None:
+        # use extracted pose files (they may include gx,gy,gz if present)
+        gyro_sources = saved
+    else:
+        gyro_sources = []
+
+    gyro_bias, gyro_std = mean_gyro_from_files(gyro_sources)
+
+    # Magnetometer calibration: prefer explicit --mag-files; otherwise try using saved extracted segments
+    if args.mag_files and len(args.mag_files) > 0:
+        mag_sources = args.mag_files
+    elif saved is not None:
+        mag_sources = saved
+    else:
+        mag_sources = []
+
+    if len(mag_sources) > 0:
+        mag_bias, mag_scale = compute_mag_cal(mag_sources)
+    else:
+        mag_bias = [0.0, 0.0, 0.0]
+        mag_scale = [1.0, 1.0, 1.0]
 
     calib = {
         'accel_bias': accel_bias,
         'accel_scale': accel_scale,
         'gyro_bias': gyro_bias.tolist(),
         'gyro_std': gyro_std.tolist(),
+        'mag_bias': mag_bias,
+        'mag_scale': mag_scale,
         'created': datetime.utcnow().isoformat() + 'Z'
     }
 

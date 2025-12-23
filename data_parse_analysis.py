@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from scipy.signal import butter, filtfilt, detrend
 
 import math
+import argparse
 
 
 class MadgwickAHRS:
@@ -189,30 +190,21 @@ def integrate_trap(a, t):
     return out
 
 
-def process_file(path, n_bias=200, fc_acc=5.0):
+def process_file(path, n_bias=200, fc_acc=10.0, calib=None, zupt_min_sec=0.5, use_mag=True, madgwick_beta=None):
 	df = pd.read_csv(path)
 
-	# apply calibration if present
-	try:
-		import json
-		with open('calib.json', 'r') as fh:
-			calib = json.load(fh)
-		ab = np.array(calib.get('accel_bias', [0,0,0]), dtype=float)
-		ascale = np.array(calib.get('accel_scale', [1,1,1]), dtype=float)
-		gb = np.array(calib.get('gyro_bias', [0,0,0]), dtype=float)
-		if 'ax' in df.columns:
-			df['ax'] = (df['ax'] - ab[0]) * ascale[0]
-			df['ay'] = (df['ay'] - ab[1]) * ascale[1]
-			df['az'] = (df['az'] - ab[2]) * ascale[2]
-		if 'gx' in df.columns:
-			df['gx'] = df['gx'] - gb[0]
-			df['gy'] = df['gy'] - gb[1]
-			df['gz'] = df['gz'] - gb[2]
-		print('Loaded calibration from calib.json and applied to dataframe')
-	except FileNotFoundError:
-		pass
-	except Exception as e:
-		print('Warning: failed to load/apply calib.json:', e)
+	# apply accel calibration if provided (bias then scale)
+	if calib is not None:
+		try:
+			ab = np.array(calib.get('accel_bias', [0, 0, 0]), dtype=float)
+			ascale = np.array(calib.get('accel_scale', [1, 1, 1]), dtype=float)
+			if 'ax' in df.columns:
+				df['ax'] = (df['ax'] - ab[0]) * ascale[0]
+				df['ay'] = (df['ay'] - ab[1]) * ascale[1]
+				df['az'] = (df['az'] - ab[2]) * ascale[2]
+			print('Applied accel calibration from calib.json')
+		except Exception as e:
+			print('Warning: failed to apply accel calib:', e)
 
 	if "t_us" in df.columns:
 		t = df["t_us"].to_numpy() * 1e-6
@@ -239,7 +231,7 @@ def process_file(path, n_bias=200, fc_acc=5.0):
 	ay0 = ay - np.mean(ay[:n_bias])
 	az0 = az - np.mean(az[:n_bias])
 
-	# read gyro (rad/s) and magnetometer if available
+	# read gyro (rad/s or deg/s) and magnetometer if available
 	if all(c in df.columns for c in ("gx", "gy", "gz")):
 		gx = df["gx"].to_numpy()
 		gy = df["gy"].to_numpy()
@@ -250,18 +242,48 @@ def process_file(path, n_bias=200, fc_acc=5.0):
 		gy = df["gy"].to_numpy() if "gy" in df.columns else np.zeros_like(ay)
 		gz = df["gz"].to_numpy() if "gz" in df.columns else np.zeros_like(az)
 
-	# guess units: if median magnitude large -> degrees/sec, convert to rad/s
+	# guess gyro units by median magnitude
 	med_g = np.median(np.abs(np.hstack((gx, gy, gz))))
-	if med_g > 50:  # likely deg/s
+	gyro_bias = np.zeros(3)
+	gyro_std = None
+	if calib is not None:
+		gyro_bias = np.array(calib.get('gyro_bias', [0, 0, 0]), dtype=float)
+		gyro_std = np.array(calib.get('gyro_std', [0, 0, 0]), dtype=float)
+
+	# if readings look like deg/s, convert both measurements and calib biases/std to rad/s
+	if med_g > 50:
 		gx = np.deg2rad(gx)
 		gy = np.deg2rad(gy)
 		gz = np.deg2rad(gz)
+		if gyro_bias is not None and np.any(gyro_bias != 0):
+			gyro_bias = np.deg2rad(gyro_bias)
+		if gyro_std is not None and np.any(gyro_std != 0):
+			gyro_std = np.deg2rad(gyro_std)
+
+	# subtract gyro bias if available
+	try:
+		gx = gx - gyro_bias[0]
+		gy = gy - gyro_bias[1]
+		gz = gz - gyro_bias[2]
+	except Exception:
+		pass
 
 	# magnetometer (optional)
 	if all(c in df.columns for c in ("mx", "my", "mz")):
 		mx = df["mx"].to_numpy()
 		my = df["my"].to_numpy()
 		mz = df["mz"].to_numpy()
+		# apply magnetometer calibration if present
+		if calib is not None:
+			try:
+				mb = np.array(calib.get('mag_bias', [0, 0, 0]), dtype=float)
+				ms = np.array(calib.get('mag_scale', [1, 1, 1]), dtype=float)
+				mx = (mx - mb[0]) * ms[0]
+				my = (my - mb[1]) * ms[1]
+				mz = (mz - mb[2]) * ms[2]
+				print('Applied magnetometer calibration from calib.json')
+			except Exception as e:
+				print('Warning: failed to apply mag calib:', e)
 		# Magnetometer outlier rejection: detect spikes and magnitude outliers
 		mag_mag = np.sqrt(mx * mx + my * my + mz * mz)
 		median_mag = np.median(mag_mag)
@@ -306,8 +328,33 @@ def process_file(path, n_bias=200, fc_acc=5.0):
 		mx = my = mz = None
 		mag_available = False
 
+	# allow caller to disable mag fusion (useful for debugging)
+	if not use_mag:
+		mag_available = False
+
 	# run Madgwick AHRS (IMU-only if mag not present)
-	madgwick = MadgwickAHRS(sample_period=1.0 / fs, beta=0.08)
+	# set beta from gyro noise estimate if available
+	beta = 0.08
+	try:
+		if gyro_std is not None and np.any(np.array(gyro_std) > 0):
+			mean_std = float(np.mean(gyro_std))
+			# ensure sensible bounds for beta
+			beta = float(min(0.5, max(0.01, 0.05 + mean_std)))
+	except Exception:
+		pass
+
+	# If caller provided an explicit beta, use it
+	if madgwick_beta is not None:
+		try:
+			beta = float(madgwick_beta)
+		except Exception:
+			pass
+
+	# If magnetometer fusion is disabled and no explicit beta was provided,
+	# increase beta to rely more on accel corrections (helps bench/static tests).
+	if not use_mag and madgwick_beta is None:
+		beta = max(beta, 0.4)
+	madgwick = MadgwickAHRS(sample_period=1.0 / fs, beta=beta)
 	quats = np.zeros((len(t), 4), dtype=float)
 	for i in range(len(t)):
 		gyr = np.array([gx[i], gy[i], gz[i]], dtype=float)
@@ -320,11 +367,12 @@ def process_file(path, n_bias=200, fc_acc=5.0):
 		quats[i, :] = q
 
 	# rotate body accel -> earth frame and subtract gravity
+	# use bias-corrected accel (ax0,ay0,az0) for rotation
 	acc_earth = np.zeros((len(t), 3), dtype=float)
 	for i in range(len(t)):
 		R = quat_to_rotmat(quats[i, :])
-		# rotate body to earth: a_e = R @ a_b
-		acc_earth[i, :] = R.dot(np.array([ax[i], ay[i], az[i]], dtype=float))
+		# rotate body to earth: a_e = R @ a_b (use bias-corrected a_b)
+		acc_earth[i, :] = R.dot(np.array([ax0[i], ay0[i], az0[i]], dtype=float))
 	# subtract gravity (z-up)
 	g_vec = np.array([0.0, 0.0, 9.80665])
 	acc_lin_earth = acc_earth - g_vec[np.newaxis, :]
@@ -343,10 +391,6 @@ def process_file(path, n_bias=200, fc_acc=5.0):
 	vy = detrend(vy, type="linear")
 	vz = detrend(vz, type="linear")
 
-	px = integrate_trap(vx, t)
-	py = integrate_trap(vy, t)
-	pz = integrate_trap(vz, t)
-
 	# detect start/stop of motion using filtered accel magnitude and bias noise
 	accel_mag = np.sqrt(ax_f * ax_f + ay_f * ay_f + az_f * az_f)
 	bias_mag = np.sqrt((ax0[:n_bias] ** 2) + (ay0[:n_bias] ** 2) + (az0[:n_bias] ** 2))
@@ -354,12 +398,99 @@ def process_file(path, n_bias=200, fc_acc=5.0):
 	a_thresh = max(0.05, 5.0 * a_std_bias)
 	moving = accel_mag > a_thresh
 	inds = np.where(moving)[0]
-	if inds.size > 0:
-		start_idx = int(inds[0])
-		stop_idx = int(inds[-1])
-	else:
+	if inds.size == 0:
+		# no motion detected -> assume stationary; zero velocity/position
 		start_idx = 0
 		stop_idx = len(t) - 1
+		vx = np.zeros_like(t)
+		vy = np.zeros_like(t)
+		vz = np.zeros_like(t)
+		px = np.zeros_like(t)
+		py = np.zeros_like(t)
+		pz = np.zeros_like(t)
+		return {
+			"t": t,
+			"ax_raw": ax,
+			"ay_raw": ay,
+			"az_raw": az,
+			"ax_f": ax_f,
+			"ay_f": ay_f,
+			"az_f": az_f,
+			"vx": vx,
+			"vy": vy,
+			"vz": vz,
+			"px": px,
+			"py": py,
+			"pz": pz,
+			"fs": fs,
+			"start_idx": start_idx,
+			"stop_idx": stop_idx,
+		}
+	else:
+		start_idx = int(inds[0])
+		stop_idx = int(inds[-1])
+
+	# Diagnostics: gravity magnitude during stationary windows
+	try:
+		stat_inds = np.where(~moving)[0]
+		if stat_inds.size > 0:
+			gm = np.linalg.norm(acc_earth[stat_inds, :], axis=1)
+			print(f'Gravity magnitude while stationary: mean={gm.mean():.3f} m/s^2, std={gm.std():.3f} m/s^2, samples={len(gm)}')
+		else:
+			print('No stationary samples for gravity diagnostic')
+	except Exception as e:
+		print('Gravity diagnostic failed:', e)
+
+	# final displacement magnitude
+	try:
+		disp = np.sqrt((px[-1] - px[0])**2 + (py[-1] - py[0])**2 + (pz[-1] - pz[0])**2)
+		vfinal = np.sqrt(vx[-1]**2 + vy[-1]**2 + vz[-1]**2)
+		print(f'Final displacement: {disp:.2f} m, final speed: {vfinal:.4f} m/s')
+	except Exception:
+		pass
+
+	# ZUPT: detect stationary segments and sequentially remove mean velocity
+	# from each segment (apply correction to segment and all subsequent samples).
+	# stationary = not moving
+	stationary = ~moving
+	min_len = max(1, int(round(zupt_min_sec * fs)))
+	# find contiguous stationary segments
+	edges_s = np.diff(stationary.astype(int))
+	starts_s = np.where(edges_s == 1)[0] + 1
+	ends_s = np.where(edges_s == -1)[0] + 1
+	if stationary[0]:
+		starts_s = np.hstack(([0], starts_s))
+	if stationary[-1]:
+		ends_s = np.hstack((ends_s, [len(stationary)]))
+
+	# apply sequential correction
+	vx_corr = vx.copy()
+	vy_corr = vy.copy()
+	vz_corr = vz.copy()
+	for s, e in zip(starts_s, ends_s):
+		if (e - s) >= min_len:
+			# compute mean velocity during this stationary window (current corrected arrays)
+			vxm = float(np.mean(vx_corr[s:e]))
+			vym = float(np.mean(vy_corr[s:e]))
+			vzm = float(np.mean(vz_corr[s:e]))
+			# subtract this mean from this segment and all subsequent samples
+			vx_corr[s:] -= vxm
+			vy_corr[s:] -= vym
+			vz_corr[s:] -= vzm
+			# also zero velocities inside the stationary window for clarity
+			vx_corr[s:e] = 0.0
+			vy_corr[s:e] = 0.0
+			vz_corr[s:e] = 0.0
+
+	vx = vx_corr
+	vy = vy_corr
+	vz = vz_corr
+
+	px = integrate_trap(vx, t)
+	py = integrate_trap(vy, t)
+	pz = integrate_trap(vz, t)
+
+    
 
 	return {
 		"t": t,
@@ -446,8 +577,59 @@ def main():
 		return
 	path = files[0]
 	print(f"Processing: {path}")
-	res = process_file(path)
+	p = argparse.ArgumentParser()
+	p.add_argument('--fc-acc', type=float, default=10.0, help='Lowpass cutoff for accel (Hz)')
+	p.add_argument('--zupt-min-sec', type=float, default=0.5, help='Minimum stationary duration for ZUPT (s)')
+	p.add_argument('--no-mag', action='store_true', help='Disable magnetometer fusion (debug)')
+	p.add_argument('--madgwick-beta', type=float, default=None, help='Override Madgwick beta (float)')
+	args, _ = p.parse_known_args()
+
+	# try to load calib.json if present and pass to processor
+	calib = None
+	try:
+		import json
+		with open('calib.json', 'r') as fh:
+			calib = json.load(fh)
+		print('Loaded calib.json')
+	except FileNotFoundError:
+		pass
+	except Exception as e:
+		print('Warning: failed to load calib.json:', e)
+
+	res = process_file(path, fc_acc=args.fc_acc, calib=calib, zupt_min_sec=args.zupt_min_sec, use_mag=(not args.no_mag), madgwick_beta=args.madgwick_beta)
 	print(f"Estimated sample rate: {res['fs']:.2f} Hz")
+
+	# Additional diagnostics computed from results
+	t = res['t']
+	ax_f = res['ax_f']
+	ay_f = res['ay_f']
+	az_f = res['az_f']
+	vx = res['vx']
+	vy = res['vy']
+	vz = res['vz']
+	px = res['px']
+	py = res['py']
+	pz = res['pz']
+	# recompute moving mask using filtered linear accel magnitude
+	accel_mag = np.sqrt(ax_f * ax_f + ay_f * ay_f + az_f * az_f)
+	a_thresh = 0.05
+	moving = accel_mag > a_thresh
+	stat_inds = np.where(~moving)[0]
+	if stat_inds.size > 0:
+		# approximate acc_earth from filtered linear accel + gravity
+		g_vec = np.array([0.0, 0.0, 9.80665])
+		acc_earth_est = np.vstack((ax_f, ay_f, az_f)).T + g_vec[np.newaxis, :]
+		gm = np.linalg.norm(acc_earth_est[stat_inds, :], axis=1)
+		print(f'[main] Gravity magnitude while stationary: mean={gm.mean():.3f} m/s^2, std={gm.std():.3f} m/s^2, samples={len(gm)}')
+	else:
+		print('[main] No stationary samples for gravity diagnostic')
+
+	try:
+		disp = np.sqrt((px[-1] - px[0])**2 + (py[-1] - py[0])**2 + (pz[-1] - pz[0])**2)
+		vfinal = np.sqrt(vx[-1]**2 + vy[-1]**2 + vz[-1]**2)
+		print(f'[main] Final displacement: {disp:.2f} m, final speed: {vfinal:.4f} m/s')
+	except Exception:
+		pass
 	plot_results(res)
 
 
