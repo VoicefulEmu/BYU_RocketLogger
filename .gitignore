@@ -18,3 +18,4 @@ build/
 # Local config / secrets (create these locally, don’t commit)
 secrets.h
 wifi_config.h
+*.csv 
