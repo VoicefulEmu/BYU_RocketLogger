@@ -6,6 +6,8 @@
 #include "SDCardLog.h"
 #include "DataTypes.h"
 #include "WebUI.h"
+#include "MavlinkOut.h"
+
 
 static const int SD_CS = 5;
 
@@ -15,6 +17,10 @@ static uint32_t next_log_time_us = 0;
 
 void setup() {
   Serial.begin(115200);
+  Serial2.begin(57600, SERIAL_8N1, 16, 17); // RX=16, TX=17 (example pins)
+
+mavlink_setup();
+
   delay(200);
 
   Wire.begin();
@@ -63,5 +69,7 @@ void loop() {
       sdlog_write_csv(s);        // fixed-rate logging
     }
     webui_set_latest(s);         // live display still updates at log rate
+    
+    mavlink_send_sample(s);
   }
 }
