@@ -20,3 +20,5 @@ secrets.h
 wifi_config.h
 *.csv 
 *.json
+
+*.pbix
